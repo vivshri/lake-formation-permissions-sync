@@ -8,13 +8,14 @@ This Lambda function processes unprocessed Glue/Lake Formation events from Dynam
 4. The process repeats until all events are processed or an error occurs.
 The function ensures exactly-once, ordered processing and prevents duplicate or out-of-order event handling.
 """
-from urllib import response
+# from urllib import response
 import boto3
 import json
 import ast
 import os
 import time
 import random
+from decimal import Decimal
 from configparser import ConfigParser
 from botocore.errorfactory import ClientError
 from botocore.exceptions import BotoCoreError, EndpointConnectionError
@@ -45,6 +46,8 @@ SOURCE_REGION = config['AwsDataCatalog']['source_region']
 TARGET_REGION = config['AwsDataCatalog']['destination_region']
 table_s3_mapping = ast.literal_eval(config.get('AwsDataCatalog', 'S3BucketMapping'))
 
+print (f"Config loaded: Source={SOURCE_REGION}, Target={TARGET_REGION}, S3Mapping={table_s3_mapping}")
+
 # ---- AWS Clients ----
 session = boto3.Session()
 dynamodb = boto3.resource('dynamodb', region_name=SOURCE_REGION)
@@ -59,7 +62,8 @@ RETRYABLE_ERROR_CODES = {
     "RequestLimitExceeded", "ServiceUnavailable", "SlowDown",
     "InternalServiceException", "OperationTimeoutException",
     "ConcurrentModificationException", "ProvisionedThroughputExceededException",
-    "LimitExceededException"
+    "LimitExceededException",
+    "ConcurrentModificationException"
 }
 
 MAX_ATTEMPTS = 8
@@ -177,6 +181,18 @@ def mark_event_and_update_checkpoint(event_id, new_event_time):
         raise
 
 
+def mark_event_processed_only(event_id):
+    """Mark a single event as processed (Processed = Y) if currently N."""
+    table.update_item(
+        Key={'EventId': event_id},
+        UpdateExpression="SET #p = :y",
+        ConditionExpression="#p = :n",
+        ExpressionAttributeNames={"#p": "Processed"},
+        ExpressionAttributeValues={":y": "Y", ":n": "N"}
+    )
+    print(f"Event {event_id} marked processed (no checkpoint update).")
+
+
 def _sleep_with_jitter(base, attempt):
     cap = min(MAX_BACKOFF, base * (2 ** attempt))
     time.sleep(random.uniform(0, cap))
@@ -226,27 +242,52 @@ def validate_event_order(event):
     """Ensure this event is strictly later than the last checkpoint."""
     checkpoint = get_checkpoint()
     if checkpoint and 'LastEventTime' in checkpoint:
-        if event['EventTime'] <= checkpoint['LastEventTime']:
+        def _to_int(v):
+            if isinstance(v, Decimal):
+                return int(v)
+            try:
+                return int(str(v))
+            except (TypeError, ValueError):
+                raise RuntimeError(f"Unable to interpret event time value {v!r} as integer")
+
+        event_time = _to_int(event.get('EventTime'))
+        last_time = _to_int(checkpoint['LastEventTime'])
+
+        if event_time <= last_time:
             raise RuntimeError(
                 f"Out-of-order event detected! "
-                f"EventTime {event['EventTime']} <= Last checkpoint {checkpoint['LastEventTime']}"
+                f"EventTime {event_time} <= Last checkpoint {last_time}"
             )
 
 # ---- Normalization Helpers ----
 def _normalize_table_input(boto3_parameters):
+    # Remove VersionId if present to avoid Glue conflict
+    if 'VersionId' in boto3_parameters:
+        print(f"[DEBUG] Removing VersionId from boto3_parameters: {boto3_parameters['VersionId']}")
+        boto3_parameters.pop('VersionId')
+
+    # Normalize TableInput
     ti = boto3_parameters.get('TableInput', {})
     ti.pop('isRowFilteringEnabled', None)
+
     sd = ti.get('StorageDescriptor', {})
+    
+    # Ensure NumberOfBuckets is integer
     if 'NumberOfBuckets' in sd:
         sd['NumberOfBuckets'] = int(sd['NumberOfBuckets'] or 0)
+
+    # Ensure Retention is integer
     if 'Retention' in ti:
         ti['Retention'] = int(ti['Retention'] or 0)
+
+    # Map source S3 location to target S3 location
     if 'Location' in sd:
         src_bucket = get_s3_table_target_bucket_name(sd['Location'])
         if src_bucket in table_s3_mapping:
             tgt_bucket = table_s3_mapping[src_bucket]
             ti['StorageDescriptor']['Location'] = sd['Location'].replace(src_bucket, tgt_bucket)
-
+            print(f"[DEBUG] Updated S3 Location from {src_bucket} to {tgt_bucket}")
+            
 def _normalize_partition_input_list(boto3_parameters):
     pil = boto3_parameters.get('PartitionInputList', [])
     if pil and 'StorageDescriptor' in pil[0]:
@@ -339,46 +380,134 @@ def process_event(event_name, boto3_parameters, event_id):
         raise
 
 def run_event_processing():
-    last_evaluated_key = None
+    """Process unprocessed events grouping ties by EventTime.
+
+    For each smallest unprocessed EventTime:
+      - fetch all unprocessed events with that EventTime,
+      - sort them by the nested metadata_location parameter,
+      - replay each event in that order and mark it processed (without
+        advancing the checkpoint),
+      - after the whole group is applied advance the checkpoint once.
+    """
     processed_count = 0
 
     while True:
-        query_params = {
-            "IndexName": "Processed-EventTime-index",
-            "KeyConditionExpression": Key('Processed').eq('N'),
-            "ScanIndexForward": True,  # strict ascending order
-            "Limit": 100
-        }
-        if last_evaluated_key:
-            query_params["ExclusiveStartKey"] = last_evaluated_key
+        # Find the next EventTime to process (smallest EventTime among unprocessed)
+        head = table.query(
+            IndexName="Processed-EventTime-index",
+            KeyConditionExpression=Key('Processed').eq('N'),
+            ScanIndexForward=True,
+            Limit=1
+        ).get('Items', [])
 
-        resp = table.query(**query_params)
-        items = resp.get('Items', [])
-
-        if not items:
+        if not head:
             print("No unprocessed events found.")
             break
 
-        for k in items:
-            event_id = k['EventId']
+        next_time = head[0]['EventTime']
+        print(f"Next EventTime to process: {next_time}")
+
+        # Fetch all events with that EventTime (handle pagination)
+        events = []
+        last_evaluated = None
+        while True:
+            q = {
+                'IndexName': 'Processed-EventTime-index',
+                'KeyConditionExpression': Key('Processed').eq('N') & Key('EventTime').eq(next_time),
+                'ScanIndexForward': True,
+                'ProjectionExpression': 'EventId, CloudTrailEvent',
+                'Limit': 100
+            }
+            if last_evaluated:
+                q['ExclusiveStartKey'] = last_evaluated
+
+            resp = table.query(**q)
+            events.extend(resp.get('Items', []))
+            last_evaluated = resp.get('LastEvaluatedKey')
+            if not last_evaluated:
+                break
+
+        if not events:
+            # No unprocessed events at that timestamp (race), continue
+            continue
+
+        # Extract metadata_location for sorting; fallback to EventId to be deterministic
+        def extract_metadata_location(item):
+            """Return metadata_location if table is ICEBERG, else None."""
             try:
-                # Load full event
+                ct = json.loads(item.get('CloudTrailEvent', '{}'))
+            except json.JSONDecodeError:
+                print(f"[ERROR] EventId={item.get('EventId', 'UNKNOWN')} has invalid JSON in CloudTrailEvent")
+                return None
+            except Exception as e:
+                print(f"[ERROR] EventId={item.get('EventId', 'UNKNOWN')} unexpected error decoding JSON: {e}")
+                return None
+
+            table_params = (
+                ct.get('requestParameters', {})
+                .get('tableInput', {})
+                .get('parameters', {})
+            )
+
+            if table_params.get('table_type') == 'ICEBERG':
+                return table_params.get('metadata_location')
+            return None
+
+        def sort_key(event):
+            """Sort by databaseName (asc), tableInput.name (asc), versionId (desc)."""
+            try:
+                # Parse the CloudTrailEvent JSON
+                ct_event = json.loads(event["CloudTrailEvent"])
+                params = ct_event.get("requestParameters", {})
+
+                db_name = params.get("databaseName", "")
+                table_name = params.get("tableInput", {}).get("name", "")
+                version_raw = params.get("versionId", "0")
+
+                # Convert versionId to integer
+                try:
+                    version_id = int(version_raw)
+                except (ValueError, TypeError):
+                    version_id = 0
+
+                # Invert version_id to achieve descending order
+                return (db_name, table_name, -version_id)
+
+            except Exception as e:
+                print(f"[ERROR] Failed to extract key for EventId={event.get('EventId')}: {e}")
+                return ("", "", 0)
+
+
+        events_sorted = sorted(events, key=sort_key)
+
+        # Replay in order; mark each event processed
+        for idx, event in enumerate(events_sorted):
+            event_id = event['EventId']
+            print (f"Processing EventId={event_id} at index {idx} of {len(events_sorted)} for EventTime={next_time}")
+            time.sleep(1)
+            try:
                 full_event = table.get_item(Key={'EventId': event_id}).get('Item', {})
                 if not full_event:
-                    raise RuntimeError(f"Event {event_id} disappeared")
+                    raise RuntimeError(f"Event {event_id} disappeared before processing")
 
-                validate_event_order(full_event)
+                if idx == 0:
+                    validate_event_order(full_event)
 
-                event_name = full_event['EventName']
                 cw_request = json.loads(full_event['CloudTrailEvent'])
+                event_name = cw_request['eventName']
+                
                 boto3_parameters = cloudtail_to_boto3_converter(cw_request['requestParameters'])
 
                 print(f"Processing EventId={event_id}, Name={event_name} with parameters {boto3_parameters}")
-                status, response = process_event(event_name, boto3_parameters, event_id)
+                status, _ = process_event(event_name, boto3_parameters, event_id)
 
-                if status == "Y":
-                    # Atomically mark as processed AND update checkpoint
-                    mark_event_and_update_checkpoint(event_id, full_event['EventTime'])
+                if status == 'Y':
+                    if idx == len(events_sorted) - 1:
+                        # Final event in this timestamp group: atomically mark and advance checkpoint
+                        mark_event_and_update_checkpoint(event_id, next_time)
+                    else:
+                        # Earlier events: mark processed only
+                        mark_event_processed_only(event_id)
                     processed_count += 1
                 else:
                     raise RuntimeError(f"Event {event_id} not marked processed, halting.")
@@ -388,9 +517,7 @@ def run_event_processing():
                 # Fail-fast: stop immediately to avoid gaps
                 raise
 
-        last_evaluated_key = resp.get('LastEvaluatedKey')
-        if not last_evaluated_key:
-            break
+        # Loop again to find the next timestamp
 
     return {
         'body': json.dumps(f'Process completed. {processed_count} events processed successfully.')

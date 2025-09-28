@@ -28,6 +28,7 @@ key_alias = {
     'expression': 'Expression',
     'externaldatafilteringallowlist' : 'ExternalDataFilteringAllowList',
     'filterexpression': 'FilterExpression',
+    'force': 'Force',
     'id': 'Id',
     'indexname': 'IndexName',
     'inputformat': 'InputFormat',
@@ -71,6 +72,7 @@ key_alias = {
     'skewedcolumnvaluelocationmaps': 'SkewedColumnValueLocationMaps',
     'skewedcolumnvalues': 'SkewedColumnValues',
     'skewedinfo': 'SkewedInfo',
+    'skiparchive': 'SkipArchive',
     'sortcolumns': 'SortColumns',
     'sortorder': 'SortOrder',
     'storagedescriptor': 'StorageDescriptor',
@@ -95,7 +97,8 @@ key_alias = {
     'viewexpandedtext': 'ViewExpandedText',
     'partitioninputlist': 'PartitionInputList',
     'tagvaluestoadd': 'TagValuesToAdd',
-    'tagvaluestodelete': 'TagValuesToDelete'
+    'tagvaluestodelete': 'TagValuesToDelete',
+    'versionid': 'VersionId',
 }
 
 
